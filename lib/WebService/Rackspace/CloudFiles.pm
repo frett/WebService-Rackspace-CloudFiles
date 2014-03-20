@@ -13,11 +13,13 @@ our $VERSION = '1.10';
 
 my $DEBUG = 0;
 
-has 'user'    => ( is => 'ro', isa => 'Str', required => 1 );
-has 'key'     => ( is => 'ro', isa => 'Str', required => 1 );
-has 'location'=> ( is => 'ro', isa => 'Str', required => 0, default => 'usa');
-has 'timeout' => ( is => 'ro', isa => 'Num', required => 0, default => 30 );
-has 'retries' => ( is => 'ro', isa => 'Str', required => 0, default => '1,2,4,8,16,32' );
+has 'user'    => ( is => 'ro', isa => 'Str' , required => 1 );
+has 'key'     => ( is => 'ro', isa => 'Str' , required => 1 );
+has 'location'=> ( is => 'ro', isa => 'Str' , required => 0, default => 'usa' );
+has 'region'  => ( is => 'ro', isa => 'Str' , required => 0, default => 'ORD' );
+has 'internal'=> ( is => 'ro', isa => 'Bool', required => 0, default => 0 );
+has 'timeout' => ( is => 'ro', isa => 'Num' , required => 0, default => 30 );
+has 'retries' => ( is => 'ro', isa => 'Str' , required => 0, default => '1,2,4,8,16,32' );
 
 has locations => (
     traits => [ 'Hash' ],
@@ -25,8 +27,9 @@ has locations => (
     is => 'ro',
     default => sub {
         return {
-            uk  => 'https://lon.auth.api.rackspacecloud.com/v1.0',
-            usa => 'https://auth.api.rackspacecloud.com/v1.0',
+            uk    => 'https://lon.auth.api.rackspacecloud.com/v1.0',
+            usa   => 'https://auth.api.rackspacecloud.com/v1.0',
+            usa20 => 'https://identity.api.rackspacecloud.com/v2.0/tokens',
         },
     },
     handles => {
@@ -124,26 +127,69 @@ sub _build_ua {
 sub _authenticate {
     my $self = shift;
 
-    my $request = HTTP::Request->new(
-        'GET',
+    my $request;
+    if($self->location eq 'usa20') {
+      $request = HTTP::Request->new(
+        'POST',
         $self->location_url,
-        [   'X-Auth-User' => $self->user,
-            'X-Auth-Key'  => $self->key,
-        ]
-    );
+        [
+          'Accept'       => 'application/json',
+          'Content-Type' => 'application/json',
+        ],
+        JSON::Any->to_json({
+          'auth' => {
+            'RAX-KSKEY:apiKeyCredentials' => {
+              'username' => $self->user,
+              'apiKey'   => $self->key,
+            }
+          },
+        }),
+      );
+    } else {
+      $request = HTTP::Request->new(
+          'GET',
+          $self->location_url,
+          [   'X-Auth-User' => $self->user,
+              'X-Auth-Key'  => $self->key,
+          ]
+      );
+    }
     $self->is_authenticated(1); # needed to prevent infinite recursion on auth requests
     my $response = $self->_request($request);
     $self->is_authenticated(0);
 
     confess 'Unauthorized'  if $response->code == 401;
-    confess 'Unknown error' if $response->code != 204;
 
-    my $storage_url = $response->header('X-Storage-Url')
-        || confess 'Missing storage url';
-    my $token = $response->header('X-Auth-Token')
-        || confess 'Missing auth token';
-    my $cdn_management_url = $response->header('X-CDN-Management-Url')
-        || confess 'Missing CDN management url';
+    my ($token, $storage_url, $cdn_management_url);
+    if($response->code == 204) {
+      $storage_url = $response->header('X-Storage-Url');
+      $token = $response->header('X-Auth-Token');
+      $cdn_management_url = $response->header('X-CDN-Management-Url');
+    } elsif($response->code == 200) {
+      my $json = JSON::Any->from_json($response->content);
+
+      $token = $json->{'access'}->{'token'}->{'id'};
+      foreach my $service (@{$json->{'access'}->{'serviceCatalog'}}) {
+        my $name = $service->{'name'};
+        if($name eq 'cloudFiles' || $name eq 'cloudFilesCDN') {
+          foreach my $endpoint (@{$service->{'endpoints'}}) {
+            if($endpoint->{'region'} eq $self->region) {
+              if($name eq 'cloudFiles') {
+                $storage_url = $self->internal ? $endpoint->{'internalURL'} : $endpoint->{'publicURL'};
+              } elsif($name eq 'cloudFilesCDN') {
+                $cdn_management_url = $endpoint->{'publicURL'};
+              }
+            }
+          }
+        }
+      }
+    } else {
+      confess 'Unknown error';
+    }
+
+    confess 'Missing storage url'        if(!$storage_url);
+    confess 'Missing auth token'         if(!$token);
+    confess 'Missing CDN management url' if(!$cdn_management_url);
 
     $self->storage_url($storage_url);
     $self->token($token);
